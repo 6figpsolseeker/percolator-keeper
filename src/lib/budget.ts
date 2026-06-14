@@ -64,6 +64,13 @@ export interface BudgetStats {
   haltReason?: string;
   haltKind?: HaltKind;
   config: KeeperBudgetConfig;
+  // M12: cumulative drift between recordTx(estimatedCost) and the actual on-chain
+  // realized cost reconciled via adjustForRealizedCost. Positive = the budget
+  // under-counted (we spent more SOL than we accounted for); negative = the budget
+  // over-counted (we spent less than we accounted for). Exposed so dashboards
+  // can show drift over time and ops can recalibrate priority-fee estimators.
+  realizedCostDriftLamports: number;
+  realizedCostSamples: number;
 }
 
 export type HaltKind =
@@ -172,6 +179,10 @@ export class KeeperBudget {
   private _isHalted = false;
   private _haltKind: HaltKind | undefined;
   private _haltReason: string | undefined;
+
+  // M12: realized-cost reconciliation telemetry.
+  private _realizedCostDriftLamports = 0;
+  private _realizedCostSamples = 0;
 
   constructor(config: Partial<KeeperBudgetConfig> = {}, deps: KeeperBudgetDeps = {}) {
     const envOverrides = parseEnvOverrides(deps.env ?? process.env);
@@ -358,6 +369,49 @@ export class KeeperBudget {
     // number of in-flight sends. They self-clear as each in-flight recordTx lands.
   }
 
+  /**
+   * M12: reconcile a previously-recorded estimated cost against the realized
+   * on-chain cost (parsed from the tx receipt). Adjusts cycle/hour/day spend
+   * by the delta `(realized - estimated)` so the budget accounting tracks
+   * actual SOL spend rather than upfront priority-fee estimates.
+   *
+   * Negative deltas reduce running totals (we overestimated). Positive
+   * deltas increase them (we underestimated). Drift is tracked cumulatively
+   * for observability via `getStats().realizedCostDriftLamports`.
+   *
+   * Operates on settled spend only — does NOT touch _reservedLamports /
+   * _reservedTxCount (M12 reconciliation runs strictly after recordTx, when
+   * the reservation has already been released).
+   *
+   * No-op (and zero drift) if `estimated` or `realized` is non-finite or
+   * negative.
+   */
+  adjustForRealizedCost(estimated: number, realized: number, _txType?: string): void {
+    if (!Number.isFinite(estimated) || estimated < 0) return;
+    if (!Number.isFinite(realized) || realized < 0) return;
+    const delta = realized - estimated;
+    this._realizedCostDriftLamports += delta;
+    this._realizedCostSamples++;
+
+    // Adjust running totals. Clamp at 0 so a large negative reconciliation
+    // (e.g., we estimated 50k but only spent 5k) doesn't drive counters
+    // negative — that would falsely make the budget look "underused" and
+    // allow more spend than the operator intended in this cycle.
+    this._cycleSpend = Math.max(0, this._cycleSpend + delta);
+    this._hourSpendSum = Math.max(0, this._hourSpendSum + delta);
+    this._daySpendSum = Math.max(0, this._daySpendSum + delta);
+
+    if (process.env.KEEPER_BUDGET_DEBUG === "true") {
+      logger.debug("adjustForRealizedCost", {
+        estimated,
+        realized,
+        delta,
+        cumulativeDrift: this._realizedCostDriftLamports,
+        samples: this._realizedCostSamples,
+      });
+    }
+  }
+
   getStats(): BudgetStats {
     const nowMs = this._now();
     this._rollCycleIfElapsed(nowMs);
@@ -375,6 +429,8 @@ export class KeeperBudget {
       haltReason: this._haltReason,
       haltKind: this._haltKind,
       config: { ...this.config },
+      realizedCostDriftLamports: this._realizedCostDriftLamports,
+      realizedCostSamples: this._realizedCostSamples,
     };
   }
 
