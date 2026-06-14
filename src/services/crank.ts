@@ -959,6 +959,17 @@ export class CrankService {
 
       state.failureCount++;
       txSentTotal.inc({ result: "fail", type: "crank" });
+      // M9: advance lastCrankTime on FAILURE too, not just success. `isDue` checks
+      // `Date.now() - state.lastCrankTime >= interval`. With lastCrankTime only
+      // updated on success, a market that's been failing every cycle has a stale
+      // lastCrankTime, so isDue is always true. After 10 consecutive failures
+      // isActive flips to false and the keeper SHOULD back off from intervalMs
+      // (30s) to inactiveIntervalMs (120s) — but since lastCrankTime is stale,
+      // the back-off never fires and the dead market keeps cranking every 30s,
+      // wasting RPC quota + priority fees. Advancing here makes the back-off
+      // honored: active-failing markets retry every intervalMs; deactivated
+      // markets retry every inactiveIntervalMs as designed.
+      state.lastCrankTime = Date.now();
       if (!isTransient) {
         state.consecutiveFailures++;
       } else {
